@@ -1,9 +1,12 @@
-/* 
-Here are two options to authenticate with AWS:
-   Access tokens
-   Application-based authentication using an application ID
-Choose one of these methods based on your needs and security requirements.
- */
+/* ==============================================
+Script: 01_setup_secret_and_external_access.sql
+Description: This script sets up a secret and external access integration to allow access to AWS Glue.
+             It provides two options for authentication with AWS: using access tokens or application-based authentication.
+             Choose one of these methods based on your needs and security requirements.
+===============================================
+*/
+
+
 -------------------------------------------------------------------
 -- OPTION 1: Create a secret and external access integration to allow access to AWS Glue
 -- create a secret to store the aws access key and secret key
@@ -20,9 +23,7 @@ CREATE OR REPLACE NETWORK RULE aws_glue_access_rule
   MODE = EGRESS
   TYPE = HOST_PORT
   VALUE_LIST = ('glue.us-west-2.amazonaws.com', 
-                'glue.us-west-2.api.aws',
-                'athena.us-west-2.amazonaws.com',
-                'athena.us-west-2.api.aws'); 
+                'glue.us-west-2.api.aws'); 
 
 
 -- create external access integration to allow access to glue
@@ -36,11 +37,37 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION aws_glue_access_int
 -- OPTION 2: Create a security integration to allow access to AWS Glue using an AWS application ID
 -- additional notes on usign aws application id access
 -- create securty integration to allow access to aws application id
--- related documentation: 
+-- related documentation: https://docs.snowflake.com/en/developer-guide/external-network-access/creating-using-private-aws
 
 -- follow AWS documentation to create an IAM role: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create.html
 -- add permissions for glue: https://docs.aws.amazon.com/glue/latest/dg/set-up-iam.html
 -- https://docs.aws.amazon.com/athena/latest/ug/security-iam-athena.html
+
+-- Sample, minimal IAM policy for Glue access:
+/* 
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "VisualEditor0",
+			"Effect": "Allow",
+			"Action": [
+				"glue:CreateTable",
+				"glue:UpdateTable",
+				"glue:GetTable",
+				"glue:GetDatabase"
+			],
+			"Resource": [
+				"arn:aws:glue:us-west-2:087354435437:catalog",
+				"arn:aws:glue:us-west-2:087354435437:table/<my athena database>/*",
+				"arn:aws:glue:us-west-2:087354435437:database/<my athena database>"
+			]
+		}
+	]
+}
+*/
+
+
 
 CREATE OR REPLACE SECURITY INTEGRATION aws_glue_security_integration
   TYPE = API_AUTHENTICATION
