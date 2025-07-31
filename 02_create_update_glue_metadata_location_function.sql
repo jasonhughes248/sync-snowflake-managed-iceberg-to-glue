@@ -1,17 +1,52 @@
--- this procedure is used to update the metadata location of an Iceberg table in AWS Glue
--- changes from function:
----- convert update function to procedure, so we can create temporary table to clear stream 
----- updated glue client to use cloud provider token
----- added function to clear stream after updating glue metadata
----- leverage logging  
+/* ==============================================
+Procedure: update_glue_metadata_location_poc
+Description:  These procedures update the metadata location of an Iceberg table in AWS Glue
+              to create the procedure:
+                 - replace aws_glue_access_int_with_token with your own external access integration
+                 - replace aws_glue_creds_secret_token with your own secret token 
+                 - replace us-west-2 with your own region
+                 - add addtional data types to the type_mapping dictionary if needed
 
 
-CREATE OR REPLACE PROCEDURE update_glue_metadata_location_poc(athena_database_name string, athena_table_name string, new_metadata_location string, snow_stream_name string)
+ Sample Call:
+ -----------------------------------------------
+ -- Update glue-athena table with snowflake iceberg table data and structure change: 
+ CALL update_glue_metadata_location(
+     'my_athena_db',
+     'my_athena_table',
+     get_ddl('table', 'my_snow_db.my_snow_schema.my_snow_iceberg_table'),
+     CAST(GET(PARSE_JSON(SYSTEM$GET_ICEBERG_TABLE_INFORMATION('my_snow_db.my_snow_schema.my_snow_iceberg_table')), 'metadataLocation') AS VARCHAR) ,
+     'my_snowflake_stream_name'  
+ );
+----------------------------------------------- 
+===============================================
+ Change History
+===============================================
+ Date        | Author        | Description
+-------------|---------------|------------------------------------------------------
+2025-06-18   | J. Hughes     | Initial version: created update function
+2025-07-10   | J. Ma         | convert update function to procedure, so we can create temporary table to clear stream
+             |               | updated glue client to use cloud provider token
+             |               | added function to clear stream after updating glue metadata
+             |               | leverage logging
+2025-07-25   | J. Ma         | updated update procedure to automatically sync schema changes from Snowflake to Athena
+             |               | Combined create table logic and update logic into one procedure
+             |               | For data type conversion, timezone is not converted, so it is assumed that the data in Snowflake and Athena are in the same timezone.
+             |               | For data type conversion, geometry types are not supported in Athena, it is currently not mappped. 
+===============================================
+*/
+
+CREATE OR REPLACE PROCEDURE update_glue_metadata_location(
+    athena_database_name string, 
+    athena_table_name string, 
+    snowflake_table_ddl string,
+    snow_metadata_location string, 
+    snow_stream_name string)
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('boto3','botocore', 'snowflake-snowpark-python')
-HANDLER = 'update_table'
+HANDLER = 'check_and_update'
 EXTERNAL_ACCESS_INTEGRATIONS = (aws_glue_access_int_with_token)
 SECRETS = ('cred'=aws_glue_creds_secret_token)
 EXECUTE AS CALLER
@@ -23,12 +58,11 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 import logging
 from datetime import datetime
+import re
 
 
 logger = logging.getLogger("python_logger")
-
 logging.basicConfig(level=logging.INFO) 
-
 logger.info(f"Logging from [{__name__}].")
 
 
@@ -50,15 +84,137 @@ glue_client = boto3.client(
 )
 
 
-def get_table_details(database_name, table_name):
+def check_table_exists(athena_database_name, athena_table_name):
+    try:
+        response = glue_client.get_table(
+            DatabaseName=athena_database_name,
+            Name=athena_table_name
+        )
+        return True  # Table exists
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'EntityNotFoundException':
+            return False  # Table does not exist
+        else:
+            logger.exception(f"Sth wrong when checking if {table_name} exists in athena. ")
+
+def extract_base_s3_path(full_s3_path: str) -> str:
+    base_path = full_s3_path.rsplit('/', 1)[0] + '/'
+    return base_path
+
+def create_table(database_name, table_name, col_definition_str, metadata_location):
+    column_def = parse_columns_to_glue_format (col_definition_str)
+    output_location = extract_base_s3_path (metadata_location)
+
+    table_input = {
+            'Name': table_name,
+            'TableType': 'EXTERNAL_TABLE',
+            'StorageDescriptor': {
+                'Columns': column_def, # Use the parsed columns
+                'Location': output_location,
+            },
+            'Parameters': {
+                'metadata_location': metadata_location,
+                'table_type': 'ICEBERG'
+            }
+    }
+
+    
+     
+    # Start query execution for table creation
+    try: 
+        response =   response = glue_client.create_table(
+            DatabaseName=database_name,
+            TableInput=table_input
+        )
+    except Exception as e:
+            logger.exception(f" Failed to create {table_name} in database {database_name}:{str(e)} ")
+
+
+def get_table_details(athena_database_name, athena_table_name):
     response = glue_client.get_table(
-        DatabaseName=database_name, 
-        Name=table_name
+        DatabaseName=athena_database_name, 
+        Name=athena_table_name
     )
 
     return response
 
+def extract_snow_columns(table_ddl: str) -> str:
+    start_idx = table_ddl.find('(')
+    end_idx = table_ddl.rfind(')')
 
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        # Extract the content between the first '(' and the last ')'
+        columns_block = table_ddl[start_idx + 1:end_idx].strip()
+        logger.debug(f"extract_columns_handler: Extracted columns_block: '{columns_block}'")
+        
+        # Clean up any extra whitespace around commas
+        final_columns_string = re.sub(r'\s*,\s*', ', ', columns_block).strip()
+        
+        logger.debug(f"extract_columns_handler: Final processed columns string: '{final_columns_string}'")
+        return final_columns_string
+    else:
+        logger.error(f"Could not extract column block from DDL: {table_ddl}")
+        return ""
+
+def parse_columns_to_glue_format(columns_str: str) -> list:
+    """
+    Parses a string like 'col1 INT, col2 STRING' into a list of Glue column dictionaries.
+    Handles basic types and maps them to Glue compatible types using a dictionary for cleaner mapping.
+    """
+    logger.debug(f"parse_columns_to_glue_format: Input columns_str: '{columns_str}'")
+    type_mapping = {
+        'number': 'int',
+        'int': 'int',
+        'integer': 'int',
+        'string': 'string',
+        'varchar': 'string',
+        'text': 'string',
+        'float': 'double',
+        'double': 'double',
+        'boolean': 'boolean',
+        'date': 'date',
+        'timestamp_ntz(6)': 'timestamp'
+    }
+
+    parsed_columns = []
+    column_defs = columns_str.split(',')
+    logger.debug(f"parse_columns_to_glue_format: Split column_defs: {column_defs}")
+
+    for i, col_def in enumerate(column_defs):
+        col_def = col_def.strip()
+        logger.debug(f"parse_columns_to_glue_format: Processing col_def[{i}]: '{col_def}'")
+        if not col_def:
+            logger.debug(f"parse_columns_to_glue_format: Skipping empty col_def at index {i}.")
+            continue
+
+        parts = col_def.split(' ', 1)
+        logger.debug(f"parse_columns_to_glue_format: col_def[{i}] split parts: {parts}")
+
+        if len(parts) >= 2:
+            col_name = parts[0].strip()
+            raw_col_type = parts[1].strip().lower()
+
+            glue_type = raw_col_type # Default to raw type
+
+            if raw_col_type.startswith('timestamp'):
+                glue_type = 'timestamp'
+            elif raw_col_type.startswith('decimal') or raw_col_type.startswith('numeric'):
+                # Keep decimal/numeric types as they are (e.g., decimal(10,2))
+                glue_type = raw_col_type
+            elif raw_col_type in type_mapping:
+                glue_type = type_mapping[raw_col_type]
+            else:
+                glue_type = 'string' # Fallback for unknown types
+                logger.warning(f"Unknown column type '{raw_col_type}' for column '{col_name}'. Defaulting to 'string'.")
+
+            parsed_columns.append({'Name': col_name, 'Type': glue_type})
+            logger.debug(f"parse_columns_to_glue_format: Added column: {{'Name': '{col_name}', 'Type': '{glue_type}'}}")
+        else:
+            logger.warning(f"Malformed column definition at index {i}: '{col_def}'. Skipping.")
+    
+    logger.debug(f"parse_columns_to_glue_format: Final parsed_columns: {parsed_columns}")
+    return parsed_columns
+    
 def clear_stream(session, stream_name):
     try:
         tmp_table_name = f"{stream_name}_tmp"
@@ -71,9 +227,11 @@ def clear_stream(session, stream_name):
         logger.exception(f"Error in clear_stream: {str(e)}")
         return f"Error: {str(e)}"
         
-def update_table(session, database_name, table_name, new_metadata_location, snow_stream_name):
+def update_table( database_name, table_name, snow_table_def, new_metadata_location, snow_stream_name):
     existing_table = get_table_details(database_name, table_name)
-
+    snow_column_def = extract_snow_columns (snow_table_def)
+    glue_column_list = parse_columns_to_glue_format (snow_column_def)
+    
     update_table_dict = {
         'DatabaseName': database_name,
         'TableInput': existing_table['Table']
@@ -82,7 +240,13 @@ def update_table(session, database_name, table_name, new_metadata_location, snow
     update_table_dict['TableInput']['Parameters']['previous_metadata_location'] = update_table_dict['TableInput']['Parameters']['metadata_location']
     update_table_dict['TableInput']['Parameters']['metadata_location'] = new_metadata_location
 
-
+    if 'Parameters' not in update_table_dict['TableInput']:
+            update_table_dict['TableInput']['Parameters'] = {}
+            
+    # if 'StorageDescriptor' not in update_table_dict['TableInput']:
+    #    update_table_dict['TableInput']['StorageDescriptor'] = {}
+    update_table_dict['TableInput']['StorageDescriptor']['Columns'] = glue_column_list
+        
     keys_to_remove = ['DatabaseName', 'CreatedBy', 'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId', 'IsMultiDialectView', 'CreateTime', 'UpdateTime']
     
     for key in keys_to_remove:
@@ -95,225 +259,24 @@ def update_table(session, database_name, table_name, new_metadata_location, snow
         logger.info(f"Successfully updated for {table_name} at {datetime.now()}")
 
         str_clear_response = clear_stream (session, snow_stream_name)
-        return 'successful update'
+        return 'successful update. '
     except Exception as e:
         logger.exception("An error occurred during updated for {table_name} at {datetime.now()}")
         return 'failed to update: ' + str(e)
 
+
+def check_and_update(session, athena_database_name, athena_table_name, snow_table_def, snow_metadata_location, snow_stream_name):
+
+    if not check_table_exists(athena_database_name, athena_table_name):
+        logger.info(f"Table {athena_table_name} does not exist. Creating table...")
+        create_table(athena_database_name, athena_table_name, snow_table_def, snow_metadata_location)
+        logger.info(f"Table {athena_table_name} created successfully in glue catalog.")
+        return f"Table {athena_table_name} created successfully in glue catalog."
+    else:
+        logger.info(f"Table {athena_table_name} exists. Perform update...")
+        update_table(athena_database_name, athena_table_name, snow_table_def, snow_metadata_location, snow_stream_name)
+        logger.info(f"Updated table: {athena_table_name} ")
+        return f"Table {athena_table_name} already exists in glue catalog. Updated."
 $$
 ;
 
--- this procedure is used to recreate the table in Athena if it does not exist or if the schema is different
--- it expects the table definition in Snowflake format from get_ddl function
--- sample call to run the procedure: 
---    call recreate_table_in_athena_poc('my_athena-db',   'my_athena_table', 
---          get_ddl('table', 'my_snow_db.my_snow_schema.my_snow_iceberg_table'),
- --         REGEXP_SUBSTR(CAST(GET(PARSE_JSON(SYSTEM$GET_ICEBERG_TABLE_INFORMATION('my_snow_iceberg_table')), 'metadataLocation') AS VARCHAR), 's3://[^/]+/[^/]+/[^/]+/TESTSC/')  
---          );           
--- it creates table in Athena if it does not exist or if the schema is different
--- it drops and recreates the table if the table structure is different (to be enhanced)
---  Notes for the function: compare_schema, which compares the structure of an Athena table with a Snowflake-managed table.
----- It primarily identifies columns that have been added or dropped between the two tables.
----- Column order is ignored in the comparison; differences in column order will be considered as changes.
----- For column types, all Snowflake timestamp_* columns are converted to the 'timestamp' type in Athena.
----- No timezone conversions are applied during the column type transformation.
-
-
-CREATE OR REPLACE PROCEDURE recreate_table_in_athena_poc(database_name string, table_name string, table_def string, output_location string)
-RETURNS STRING
-LANGUAGE PYTHON
-RUNTIME_VERSION = 3.11
-HANDLER = 'check_and_create_table'
-EXTERNAL_ACCESS_INTEGRATIONS = (aws_glue_access_int_with_token)
-PACKAGES = ('boto3','botocore', 'snowflake-snowpark-python')
-SECRETS = ('cred' = aws_glue_creds_secret_token)
-AS
-$$
-
-import _snowflake
-import boto3
-import time
-from botocore.config import Config
-from botocore.exceptions import ClientError
-import logging
-from datetime import datetime
-import re
-
-logger = logging.getLogger("python_logger")
-logger.info(f"Logging from [{__name__}].")
-
-
-
-cloud_provider_object = _snowflake.get_cloud_provider_token('cred')
-
-config = Config(
-    retries=dict(total_max_attempts=9),
-    connect_timeout=30,
-    read_timeout=30,
-    max_pool_connections=50
-)
-
-glue_client = boto3.client(
-    service_name='glue',
-    aws_access_key_id = cloud_provider_object.access_key_id,
-    aws_secret_access_key = cloud_provider_object.secret_access_key,
-    aws_session_token=cloud_provider_object.token,
-    region_name='us-west-2'
-)
-
-athena_client = boto3.client(
-    service_name='athena',
-    aws_access_key_id = cloud_provider_object.access_key_id,
-    aws_secret_access_key = cloud_provider_object.secret_access_key,
-    aws_session_token=cloud_provider_object.token,
-    region_name='us-west-2'
-)
-
-def check_table_exists(database_name, table_name):
-    try:
-        response = glue_client.get_table(
-            DatabaseName=database_name,
-            Name=table_name
-        )
-        return True  # Table exists
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'EntityNotFoundException':
-            return False  # Table does not exist
-        else:
-            logger.exception(f"Sth wrong when checking if {table_name} exists in athena. ")
-            raise e  # Re-raise if it's another error
-
-def columns_to_string(existing_columns):
-    return ', '.join([
-        f"{col['Name'].upper()} {col['Type'].upper()}"
-        for col in existing_columns
-    ])
-
-
-def compare_schema (database_name, table_name , column_list_str ):
-    try:
-        response = glue_client.get_table(
-            DatabaseName=database_name,
-            Name=table_name
-        )
-        existing_columns = response['Table']['StorageDescriptor']['Columns']
-        existing_columns_str = columns_to_string (existing_columns)
-
-        def compare_strings_ignore_space_case(str1, str2):
-            normalize = lambda s: ''.join(s.split()).lower()
-            return 'same' if normalize(str1) == normalize(str2) else 'diff'
-           
-        result = compare_strings_ignore_space_case(column_list_str, existing_columns_str)
-        return result
-    except Exception as e:
-        logger.exception(f"Sth wrong in compare_schema. ")
-        return 'error'
-       
-def convert_to_athena_schema(def_str):
-    return ', '.join([
-        col.strip().replace(':', ' ').upper()
-        for col in def_str.split(',')
-    ])
-
-def extract_snow_columns(table_ddl: str) -> str:
-    start_idx = table_ddl.find('(')
-    end_idx = table_ddl.rfind(')')
-
-    if start_idx != -1 and end_idx != -1:
-        columns_block = table_ddl[start_idx + 1:end_idx].strip()
-        columns_block_list = columns_block.split(',')  # Split by commas for each column definition
-       
-        for i, col in enumerate(columns_block_list):
-            col = col.strip()
-           
-            if 'TIMESTAMP_' in col:
-                # Separate the column name and its type (e.g., 'insert_time TIMESTAMP_NTZ(6)')
-                parts = col.split(' ', 1)
-               
-                if len(parts) == 2:
-                    col_name, col_type = parts
-                   
-                    # Replace TIMESTAMP_* with just TIMESTAMP, removing the precision/argument inside parentheses
-                    if col_type.startswith('TIMESTAMP_'):
-                        col_type = 'TIMESTAMP'  # Keep only 'TIMESTAMP', ignore the rest
-                   
-                    # Rebuild the column definition
-                    columns_block_list[i] = f"{col_name} {col_type}"
-
-        # Rebuild the final columns block into a single string
-        columns_block = ', '.join(columns_block_list).strip()
-       
-        return columns_block
-
-    else:
-        return ""      
-   
-def create_table(database_name, table_name, col_definition_str, output_location):
-    column_def = convert_to_athena_schema(col_definition_str)
-    create_table_query = f"""
-    CREATE TABLE IF NOT EXISTS {database_name}.{table_name} (
-        {column_def}
-    )
-    LOCATION '{output_location}'
-    TBLPROPERTIES (
-    'table_type' = 'ICEBERG',
-    'format' = 'parquet',
-    'write_compression' = 'snappy'
-    );
-    """
-    logger.info(f" SQL to create in athena is {create_table_query} ")
-    # Start query execution for table creation
-    response = athena_client.start_query_execution(
-        QueryString=create_table_query,
-        QueryExecutionContext={'Database': '{database_name}'},
-        ResultConfiguration={'OutputLocation': output_location}
-    )
-
-    query_execution_id = response['QueryExecutionId']
-   
-    # Wait for the query execution to complete
-    while True:
-        result = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
-        status = result['QueryExecution']['Status']['State']
-       
-        if status == 'SUCCEEDED':
-            logger.info(f"{table_name} created successfully in database {database_name}. ")
-            return True
-        elif status in ['FAILED', 'CANCELLED']:
-            logger.exception(f" Failed to create {table_name} in database {database_name}. ")
-            return False
-        time.sleep(2)  # Wait 2 seconds before checking again
-
-   
-
-def drop_and_recreate_if_diff(database_name, table_name, new_column_list_str, s3_location):
-    result = compare_schema(database_name, table_name, new_column_list_str)
-
-    if result == 'diff':
-        try:
-            glue_client.delete_table(DatabaseName=database_name, Name=table_name)
-            logger.info(f"Dropped mismatched table: {database_name}.{table_name}")            
-        except ClientError as e:
-            logger.exception(f" {table_name} could not be deleted (might not exist): {e}")
-       
-        create_table(database_name, table_name, new_column_list_str, s3_location)
-        return 'recreated'
-    else:
-        logger.info(f" Table schema is in sycn with snowflake src table: {database_name}.{table_name}")
-        return 'nothing done'
- 
-# Check and create the table if it doesn't exist
-def check_and_create_table(database_name, table_name, table_definition, output_location):
-    snow_table_column_definition = extract_snow_columns (table_definition)
-
-    if not check_table_exists(database_name, table_name):
-        logger.info(f"Table {table_name} does not exist. Creating table...")
-        logger.debug(f" table_definition is {snow_table_column_definition} ")
-        logger.debug(f" output_location is {output_location} ")
-        return create_table(database_name, table_name, snow_table_column_definition, output_location)
-    else:
-        logger.info(f"Table '{table_name}' check table change. Recreated if needed...")
-        recreate_flag = drop_and_recreate_if_diff(database_name, table_name, snow_table_column_definition, output_location)
-        return recreate_flag
-
-$$;
