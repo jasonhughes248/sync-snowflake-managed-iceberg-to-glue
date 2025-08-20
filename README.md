@@ -35,4 +35,6 @@ This solution is intended as a temporary workaround until either:
 
 Once either of these long-term solutions becomes available, this synchronization mechanism should no longer be necessary.
 
+### Warning
 
+This solution does not attempt to merge any changes made outside of Snowflake to these Iceberg tables. Therefore, any modifications should be prevented so no other engine/tool can make changes to these tables.
